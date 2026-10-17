@@ -35,17 +35,24 @@ import {
   MessageCircle,
   MousePointer2,
   Package,
+  PackageOpen,
   Palette,
+  Printer,
+  RotateCcw,
+  RotateCw,
   Ruler,
   ShieldCheck,
   Sparkles,
   Star,
   Trash2,
   Truck,
+  Type,
   X,
   Zap,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
-import type { ArtworkPlacement, Face, MaterialId } from '@/components/3d/BoxCanvas';
+import type { ArtworkPlacement, CanvasCommand, Face, MaterialId } from '@/components/3d/BoxCanvas';
 
 // WebGL is client-only, so skip SSR for the canvas
 const BoxCanvas = dynamic(() => import('@/components/3d/BoxCanvas'), {
@@ -61,8 +68,7 @@ const BoxCanvas = dynamic(() => import('@/components/3d/BoxCanvas'), {
 /* Pricing engine                                                     */
 /* ================================================================== */
 
-const QUANTITIES = [100, 200, 500, 1000] as const;
-type Quantity = (typeof QUANTITIES)[number];
+type PrintMethod = 'flexo' | 'offset';
 
 interface MaterialOption {
   id: MaterialId;
@@ -97,16 +103,50 @@ const MATERIALS: MaterialOption[] = [
   },
 ];
 
-/** Per-unit print cost (₹), which drops as volume rises: the low-MOQ price-break ladder. */
-const PRINT_COST_PER_UNIT: Record<Quantity, number> = { 100: 18, 200: 14, 500: 10, 1000: 7 };
-const PRINT_SETUP_FEE = 500;
+/*
+ * Printing prices (₹) — placeholders, replace with your real costs.
+ * Flexo: one ink colour, one plate per printed side, so it's charged per side.
+ * Offset: full colour (CMYK), one flat setup charge, higher minimum quantity.
+ */
+const FLEXO_CHARGE_PER_SIDE = 1499;
+const OFFSET_SETUP_CHARGE = 9999;
+
+const PRINT_METHODS: Record<
+  PrintMethod,
+  { name: string; tagline: string; perks: string[]; minQty: number; presets: number[] }
+> = {
+  flexo: {
+    name: 'Flexo Printing',
+    tagline: '1 ink colour',
+    perks: ['1 colour, no bleed', 'Logos & simple art', 'Fast turnaround', 'Cost effective'],
+    minQty: 100,
+    presets: [100, 200, 500, 1000],
+  },
+  offset: {
+    name: 'Offset Printing',
+    tagline: 'Full colour CMYK',
+    perks: ['Full-bleed CMYK', 'Photos & complex art', 'Premium finish', 'One setup charge'],
+    minQty: 500,
+    presets: [500, 1000, 2500, 5000],
+  },
+};
+
+const MAX_QTY = 50000;
+
+/** Flexo ink cost per printed side, per box — falls as volume rises. */
+const flexoInkCost = (qty: number) => (qty >= 1000 ? 2 : qty >= 500 ? 2.5 : qty >= 200 ? 3 : 4);
+/** Offset cost per box (every side prints on one sheet) — falls as volume rises. */
+const offsetPrintCost = (qty: number) => (qty >= 2500 ? 3.5 : qty >= 1000 ? 4.5 : 6);
 
 interface PriceInput {
   length: number;
   width: number;
   height: number;
   material: MaterialId;
-  quantity: Quantity;
+  quantity: number;
+  printMethod: PrintMethod;
+  /** Number of distinct sides (outside + inside) carrying artwork */
+  printedSides: number;
 }
 
 interface PriceBreakdown {
@@ -114,7 +154,9 @@ interface PriceBreakdown {
   baseMaterialCost: number;
   printCostPerUnit: number;
   unitCost: number;
-  setupFee: number;
+  printedSides: number;
+  /** Flexo: per-side plate charge × sides. Offset: flat setup. Plain boxes: 0. */
+  printingCharge: number;
   total: number;
 }
 
@@ -123,17 +165,24 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 /**
  *   Surface Area       = 2 × (L·W + L·H + W·H)
  *   Base Material Cost = Surface Area × Material Rate
- *   Unit Cost          = Base Material Cost + Per-Unit Print Cost
- *   Total              = Unit Cost × Quantity + Setup Fee
+ *   Print Cost / box   = Flexo: ink cost × printed sides  |  Offset: flat per box
+ *   Unit Cost          = Base Material Cost + Print Cost / box
+ *   Printing Charge    = Flexo: ₹/side × printed sides    |  Offset: one setup charge
+ *   Total              = Unit Cost × Quantity + Printing Charge
  */
-function calculatePrice({ length, width, height, material, quantity }: PriceInput): PriceBreakdown {
-  const rate = MATERIALS.find((m) => m.id === material)!.rate;
-  const surfaceArea = 2 * (length * width + length * height + width * height);
+function calculatePrice(p: PriceInput): PriceBreakdown {
+  const rate = MATERIALS.find((m) => m.id === p.material)!.rate;
+  const surfaceArea = 2 * (p.length * p.width + p.length * p.height + p.width * p.height);
   const baseMaterialCost = round2(surfaceArea * rate);
-  const printCostPerUnit = PRINT_COST_PER_UNIT[quantity];
+
+  const printed = p.printedSides > 0;
+  const flexo = p.printMethod === 'flexo';
+  const printCostPerUnit = !printed ? 0 : flexo ? flexoInkCost(p.quantity) * p.printedSides : offsetPrintCost(p.quantity);
+  const printingCharge = !printed ? 0 : flexo ? FLEXO_CHARGE_PER_SIDE * p.printedSides : OFFSET_SETUP_CHARGE;
+
   const unitCost = round2(baseMaterialCost + printCostPerUnit);
-  const total = Math.round(unitCost * quantity + PRINT_SETUP_FEE);
-  return { surfaceArea, baseMaterialCost, printCostPerUnit, unitCost, setupFee: PRINT_SETUP_FEE, total };
+  const total = Math.round(unitCost * p.quantity + printingCharge);
+  return { surfaceArea, baseMaterialCost, printCostPerUnit, unitCost, printedSides: p.printedSides, printingCharge, total };
 }
 
 const inr = (value: number, digits = 0) =>
@@ -150,16 +199,42 @@ const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(mi
 /* Box configuration                                                  */
 /* ================================================================== */
 
-/** An uploaded image plus where and how it sits on the box. */
-type Artwork = ArtworkPlacement & { name: string };
+type FontId = 'display' | 'clean' | 'serif' | 'mono';
+
+interface TextStyle {
+  content: string;
+  font: FontId;
+  color: string;
+  bold: boolean;
+}
+
+/** An uploaded image or a text block, plus where and how it sits on the box. */
+type Artwork = ArtworkPlacement & { name: string; kind: 'image' | 'text'; text?: TextStyle };
+
+type InkId = 'black' | 'blue' | 'red' | 'green' | 'white' | 'gold' | 'silver';
+
+const INKS: { id: InkId; name: string; hex: string; metallic?: boolean }[] = [
+  { id: 'black', name: 'Black', hex: '#141414' },
+  { id: 'blue', name: 'Blue', hex: '#1d4ed8' },
+  { id: 'red', name: 'Red', hex: '#dc2626' },
+  { id: 'green', name: 'Green', hex: '#15803d' },
+  { id: 'white', name: 'White', hex: '#f8fafc' },
+  { id: 'gold', name: 'Gold', hex: '#d4af37', metallic: true },
+  { id: 'silver', name: 'Silver', hex: '#c0c0c0', metallic: true },
+];
+
+const inkOf = (id: InkId) => INKS.find((i) => i.id === id)!;
 
 interface BoxConfig {
+  /** Inches */
   length: number;
   width: number;
   height: number;
   material: MaterialId;
   color: string;
-  quantity: Quantity;
+  quantity: number;
+  printMethod: PrintMethod;
+  ink: InkId;
   artworks: Artwork[];
 }
 
@@ -170,10 +245,12 @@ const DEFAULT_CONFIG: BoxConfig = {
   material: 'kraft',
   color: '#b0855a',
   quantity: 200,
+  printMethod: 'flexo',
+  ink: 'black',
   artworks: [],
 };
 
-const FACES: { id: Face; label: string }[] = [
+const OUTSIDE_FACES: { id: Face; label: string }[] = [
   { id: 'top', label: 'Top' },
   { id: 'front', label: 'Front' },
   { id: 'back', label: 'Back' },
@@ -181,16 +258,99 @@ const FACES: { id: Face; label: string }[] = [
   { id: 'right', label: 'Right' },
 ];
 
-const faceLabel = (face: Face) => FACES.find((f) => f.id === face)!.label;
+const INSIDE_FACES: { id: Face; label: string }[] = [
+  { id: 'inside-lid', label: 'Lid' },
+  { id: 'inside-bottom', label: 'Base' },
+  { id: 'inside-front', label: 'Front' },
+  { id: 'inside-back', label: 'Back' },
+  { id: 'inside-left', label: 'Left' },
+  { id: 'inside-right', label: 'Right' },
+];
 
-const MAX_ARTWORKS = 10;
+const isInside = (face: Face) => face.startsWith('inside-');
+
+const faceLabel = (face: Face) =>
+  isInside(face)
+    ? `Inside ${INSIDE_FACES.find((f) => f.id === face)!.label.toLowerCase()}`
+    : OUTSIDE_FACES.find((f) => f.id === face)!.label;
+
+const printedSidesOf = (artworks: Artwork[]) => new Set(artworks.map((a) => a.face)).size;
+
+const priceInputOf = (c: BoxConfig): PriceInput => ({
+  length: c.length,
+  width: c.width,
+  height: c.height,
+  material: c.material,
+  quantity: c.quantity,
+  printMethod: c.printMethod,
+  printedSides: printedSidesOf(c.artworks),
+});
+
+const MAX_ARTWORKS = 12;
 
 const COLOR_SWATCHES = ['#b0855a', '#f5f5f4', '#111827', '#1e3a8a', '#065f46', '#9f1239', '#f59e0b', '#7c3aed'];
 
-const sizeLabel = (c: Pick<BoxConfig, 'length' | 'width' | 'height'>) =>
-  `${c.length}" × ${c.width}" × ${c.height}"`;
+type Unit = 'in' | 'cm' | 'mm';
+const UNIT_FACTOR: Record<Unit, number> = { in: 1, cm: 2.54, mm: 25.4 };
+
+/** Inches → display value in the chosen unit. */
+const toUnit = (inches: number, unit: Unit) => {
+  const v = inches * UNIT_FACTOR[unit];
+  return unit === 'mm' ? Math.round(v) : Math.round(v * 10) / 10;
+};
+
+const sizeLabel = (c: Pick<BoxConfig, 'length' | 'width' | 'height'>, unit: Unit = 'in') =>
+  unit === 'in'
+    ? `${c.length}" × ${c.width}" × ${c.height}"`
+    : `${toUnit(c.length, unit)} × ${toUnit(c.width, unit)} × ${toUnit(c.height, unit)} ${unit}`;
 
 const materialName = (id: MaterialId) => MATERIALS.find((m) => m.id === id)!.name;
+
+/* ---------- Text artwork ---------- */
+
+const FONTS: { id: FontId; label: string; cssVar?: string; fallback: string; italic?: boolean }[] = [
+  { id: 'display', label: 'Bold', cssVar: '--font-display', fallback: 'sans-serif' },
+  { id: 'clean', label: 'Clean', cssVar: '--font-inter', fallback: 'sans-serif' },
+  { id: 'serif', label: 'Elegant', cssVar: '--font-serif', fallback: 'Georgia, serif', italic: true },
+  { id: 'mono', label: 'Mono', fallback: '"Courier New", monospace' },
+];
+
+const DEFAULT_TEXT: TextStyle = { content: 'Your Brand', font: 'display', color: '#111111', bold: true };
+
+/** Renders a text block to a transparent PNG (data URL) so it can be printed like any artwork. */
+function renderTextImage(style: TextStyle): string {
+  const font = FONTS.find((f) => f.id === style.font)!;
+  const family =
+    (font.cssVar && getComputedStyle(document.documentElement).getPropertyValue(font.cssVar).trim()) || font.fallback;
+  const px = 160;
+  const fontStr = `${font.italic ? 'italic ' : ''}${style.bold ? 700 : 400} ${px}px ${family}`;
+  const lines = (style.content.trim() || ' ').split('\n');
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
+  ctx.font = fontStr;
+  const pad = px * 0.2;
+  const lineH = px * 1.15;
+  canvas.width = Math.ceil(Math.max(1, ...lines.map((l) => ctx.measureText(l).width)) + pad * 2);
+  canvas.height = Math.ceil(lineH * lines.length + pad * 2);
+
+  ctx.font = fontStr; // resizing the canvas resets its state
+  ctx.fillStyle = style.color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  lines.forEach((line, i) => ctx.fillText(line, canvas.width / 2, pad + lineH * (i + 0.5)));
+  return canvas.toDataURL('image/png');
+}
+
+/** Next free face on the chosen side of the box, else that side's main face. */
+function nextFreeFace(artworks: Artwork[], side: 'outside' | 'inside'): Face {
+  const order: Face[] =
+    side === 'inside'
+      ? ['inside-bottom', 'inside-lid', 'inside-back', 'inside-front', 'inside-left', 'inside-right']
+      : ['top', 'front', 'right', 'left', 'back'];
+  const used = new Set(artworks.map((a) => a.face));
+  return order.find((o) => !used.has(o)) ?? order[0];
+}
 
 /* ================================================================== */
 /* Page                                                               */
@@ -204,14 +364,19 @@ export default function HomePage() {
   // Every object URL handed out, so each can be revoked (no memory leaks)
   const objectUrls = useRef(new Set<string>());
 
-  const price = useMemo(() => calculatePrice(config), [config]);
+  const price = useMemo(() => calculatePrice(priceInputOf(config)), [config]);
 
   const update = useCallback(<K extends keyof BoxConfig>(key: K, value: BoxConfig[K]) => {
     setConfig((c) => ({ ...c, [key]: value }));
   }, []);
 
-  /** Adds files as artworks, filling empty faces first (top → front → right → left → back). */
-  const addArtworks = useCallback((files: File[]): string[] => {
+  /** Switching method keeps the quantity at or above that method's minimum. */
+  const setPrintMethod = useCallback((method: PrintMethod) => {
+    setConfig((c) => ({ ...c, printMethod: method, quantity: Math.max(c.quantity, PRINT_METHODS[method].minQty) }));
+  }, []);
+
+  /** Adds image files as artworks, filling empty faces on the chosen side first. */
+  const addArtworks = useCallback((files: File[], side: 'outside' | 'inside'): string[] => {
     const created = files.map((file) => {
       const url = URL.createObjectURL(file);
       objectUrls.current.add(url);
@@ -219,20 +384,45 @@ export default function HomePage() {
     });
 
     setConfig((c) => {
-      const order: Face[] = ['top', 'front', 'right', 'left', 'back'];
-      const used = new Set(c.artworks.map((a) => a.face));
-      const added = created.map((f) => {
-        const face = order.find((o) => !used.has(o)) ?? 'top';
-        used.add(face);
-        return { ...f, face, size: 0.5, offsetX: 0, offsetY: 0, rotation: 0 };
-      });
-      return { ...c, artworks: [...c.artworks, ...added] };
+      const artworks = [...c.artworks];
+      for (const f of created) {
+        artworks.push({ ...f, kind: 'image', face: nextFreeFace(artworks, side), size: 0.5, offsetX: 0, offsetY: 0, rotation: 0 });
+      }
+      return { ...c, artworks };
     });
     return created.map((f) => f.id);
   }, []);
 
-  const updateArtwork = useCallback((id: string, patch: Partial<ArtworkPlacement>) => {
-    setConfig((c) => ({ ...c, artworks: c.artworks.map((a) => (a.id === id ? { ...a, ...patch } : a)) }));
+  /** Adds a text block as a printable artwork. */
+  const addText = useCallback((side: 'outside' | 'inside'): string => {
+    const id = crypto.randomUUID();
+    const text = { ...DEFAULT_TEXT };
+    const url = renderTextImage(text);
+    setConfig((c) => ({
+      ...c,
+      artworks: [
+        ...c.artworks,
+        {
+          id,
+          url,
+          name: text.content,
+          kind: 'text',
+          text,
+          face: nextFreeFace(c.artworks, side),
+          size: 0.6,
+          offsetX: 0,
+          offsetY: 0,
+          rotation: 0,
+        },
+      ],
+    }));
+    return id;
+  }, []);
+
+  const updateArtwork = useCallback((id: string, patch: Partial<ArtworkPlacement> & { text?: TextStyle }) => {
+    // Text edits re-render the text image before it is computed into state
+    const extra = patch.text ? { url: renderTextImage(patch.text), name: patch.text.content.split('\n')[0] || 'Text' } : {};
+    setConfig((c) => ({ ...c, artworks: c.artworks.map((a) => (a.id === id ? { ...a, ...patch, ...extra } : a)) }));
   }, []);
 
   const removeArtwork = useCallback((art: Artwork) => {
@@ -263,7 +453,9 @@ export default function HomePage() {
         config={config}
         price={price}
         update={update}
+        onPrintMethod={setPrintMethod}
         onAddArtworks={addArtworks}
+        onAddText={addText}
         onUpdateArtwork={updateArtwork}
         onRemoveArtwork={removeArtwork}
         onOrder={() => setCheckoutMode('order')}
@@ -338,7 +530,7 @@ const TRUST_BADGES = [
 
 function Hero({ onLaunchStudio, onRequestSample }: { onLaunchStudio: () => void; onRequestSample: () => void }) {
   // Real example quote from the pricing engine for the hero tags
-  const sample = calculatePrice({ ...DEFAULT_CONFIG, quantity: 100 });
+  const sample = calculatePrice({ ...priceInputOf(DEFAULT_CONFIG), quantity: 100, printedSides: 1 });
 
   return (
     <section className="relative overflow-hidden">
@@ -541,17 +733,72 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
 /* 3D Studio                                                          */
 /* ================================================================== */
 
+type PrintSide = 'outside' | 'inside';
+type ArtworkPatch = Partial<ArtworkPlacement> & { text?: TextStyle };
+
 interface StudioProps {
   config: BoxConfig;
   price: PriceBreakdown;
   update: <K extends keyof BoxConfig>(key: K, value: BoxConfig[K]) => void;
-  onAddArtworks: (files: File[]) => string[];
-  onUpdateArtwork: (id: string, patch: Partial<ArtworkPlacement>) => void;
+  onPrintMethod: (method: PrintMethod) => void;
+  onAddArtworks: (files: File[], side: PrintSide) => string[];
+  onAddText: (side: PrintSide) => string;
+  onUpdateArtwork: (id: string, patch: ArtworkPatch) => void;
   onRemoveArtwork: (art: Artwork) => void;
   onOrder: () => void;
 }
 
-function Studio({ config, price, update, onAddArtworks, onUpdateArtwork, onRemoveArtwork, onOrder }: StudioProps) {
+function Studio({
+  config,
+  price,
+  update,
+  onPrintMethod,
+  onAddArtworks,
+  onAddText,
+  onUpdateArtwork,
+  onRemoveArtwork,
+  onOrder,
+}: StudioProps) {
+  const [unit, setUnit] = useState<Unit>('in');
+  const [printSide, setPrintSide] = useState<PrintSide>('outside');
+  const [lidOpen, setLidOpen] = useState(false);
+  const [autoRotate, setAutoRotate] = useState(false);
+  const [command, setCommand] = useState<CanvasCommand | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const send = (type: CanvasCommand['type'], face?: Face) => setCommand({ type, face, nonce: Date.now() });
+
+  /** Fly the camera to a side; inside sides open the lid first. */
+  const viewFace = (face: Face) => {
+    const inside = isInside(face);
+    setPrintSide(inside ? 'inside' : 'outside');
+    setLidOpen(inside);
+    setAutoRotate(false);
+    send('view', face);
+  };
+
+  const switchSide = (side: PrintSide) => {
+    setPrintSide(side);
+    setLidOpen(side === 'inside');
+    send(side === 'inside' ? 'view' : 'reset', side === 'inside' ? 'inside-bottom' : undefined);
+  };
+
+  const selectArtwork = (id: string | null) => {
+    setSelectedId(id);
+    const art = config.artworks.find((a) => a.id === id);
+    if (art) viewFace(art.face);
+  };
+
+  const updateArtwork = (id: string, patch: ArtworkPatch) => {
+    onUpdateArtwork(id, patch);
+    if (patch.face) viewFace(patch.face);
+  };
+
+  const ink = inkOf(config.ink);
+  const flexo = config.printMethod === 'flexo';
+  const sideFaces = printSide === 'inside' ? INSIDE_FACES : OUTSIDE_FACES;
+  const usedFaces = new Set(config.artworks.map((a) => a.face));
+
   return (
     <section id="studio" className="relative scroll-mt-16 py-24">
       <div className="pointer-events-none absolute left-1/2 top-40 h-[500px] w-[800px] -translate-x-1/2 rounded-full bg-amber-500/[0.07] blur-[120px]" />
@@ -561,17 +808,17 @@ function Studio({ config, price, update, onAddArtworks, onUpdateArtwork, onRemov
           eyebrow="3D Studio"
           title="Design your box."
           accent="See the price instantly."
-          subtitle="Set your size, pick a finish, and place your logo or artwork on any side. The price updates as you go."
+          subtitle="Set your size, pick a finish and print method, then place your logo, artwork or text on any side, inside or out. The price updates as you go."
         />
 
         <div className="mt-12 grid gap-6 lg:grid-cols-[380px_minmax(0,1fr)]">
           {/* ---------- Configurator sidebar ---------- */}
           <aside className="order-2 space-y-4 lg:order-1">
-            <Panel icon={Ruler} title="Dimensions" hint="Inner size, in inches">
+            <Panel icon={Ruler} title="Dimensions" hint={<UnitToggle unit={unit} onChange={setUnit} />}>
               <div className="space-y-5">
-                <DimensionSlider label="Length" value={config.length} min={4} max={16} onChange={(v) => update('length', v)} />
-                <DimensionSlider label="Width" value={config.width} min={4} max={14} onChange={(v) => update('width', v)} />
-                <DimensionSlider label="Height" value={config.height} min={2} max={8} onChange={(v) => update('height', v)} />
+                <DimensionSlider label="Length" unit={unit} value={config.length} min={4} max={16} onChange={(v) => update('length', v)} />
+                <DimensionSlider label="Width" unit={unit} value={config.width} min={4} max={14} onChange={(v) => update('width', v)} />
+                <DimensionSlider label="Height" unit={unit} value={config.height} min={2} max={8} onChange={(v) => update('height', v)} />
               </div>
             </Panel>
 
@@ -628,23 +875,36 @@ function Studio({ config, price, update, onAddArtworks, onUpdateArtwork, onRemov
               </div>
             </Panel>
 
-            <Panel icon={ImagePlus} title="Logo & artwork" hint={`${config.artworks.length}/${MAX_ARTWORKS} images`}>
+            <Panel icon={Printer} title="Printing">
+              <PrintMethodPicker config={config} price={price} onMethod={onPrintMethod} onInk={(id) => update('ink', id)} />
+            </Panel>
+
+            <Panel icon={ImagePlus} title="Logo, artwork & text" hint={`${config.artworks.length}/${MAX_ARTWORKS}`}>
               <ArtworkManager
                 artworks={config.artworks}
-                onAdd={onAddArtworks}
-                onUpdate={onUpdateArtwork}
-                onRemove={onRemoveArtwork}
+                selectedId={selectedId}
+                printSide={printSide}
+                flexo={flexo}
+                inkName={ink.name}
+                onSelect={selectArtwork}
+                onAdd={(files) => onAddArtworks(files, printSide)}
+                onAddText={() => onAddText(printSide)}
+                onUpdate={updateArtwork}
+                onRemove={(art) => {
+                  if (art.id === selectedId) setSelectedId(null);
+                  onRemoveArtwork(art);
+                }}
               />
             </Panel>
 
-            <Panel icon={Boxes} title="Quantity" hint="Low MOQ: start at 100">
+            <Panel icon={Boxes} title="Quantity" hint={`Min ${PRINT_METHODS[config.printMethod].minQty} for ${flexo ? 'flexo' : 'offset'}`}>
               <QuantitySelector config={config} onChange={(q) => update('quantity', q)} />
             </Panel>
           </aside>
 
           {/* ---------- Canvas + pricing ---------- */}
           <div className="order-1 space-y-4 self-start lg:sticky lg:top-24 lg:order-2">
-            <div className="relative h-[380px] overflow-hidden rounded-3xl border border-white/10 bg-[radial-gradient(ellipse_at_50%_40%,#2a2117_0%,#0e0e0e_55%,#050505_100%)] shadow-[0_30px_80px_-30px_rgba(0,0,0,0.9)] sm:h-[480px] lg:h-[540px]">
+            <div className="relative h-[420px] overflow-hidden rounded-3xl border border-white/10 bg-[radial-gradient(ellipse_at_50%_40%,#2a2117_0%,#0e0e0e_55%,#050505_100%)] shadow-[0_30px_80px_-30px_rgba(0,0,0,0.9)] sm:h-[500px] lg:h-[560px]">
               <BoxCanvas
                 length={config.length}
                 width={config.width}
@@ -652,21 +912,107 @@ function Studio({ config, price, update, onAddArtworks, onUpdateArtwork, onRemov
                 color={config.color}
                 material={config.material}
                 artworks={config.artworks}
+                inkColor={flexo ? ink.hex : null}
+                inkMetallic={flexo && !!ink.metallic}
+                lidOpen={lidOpen}
+                autoRotate={autoRotate}
+                command={command}
               />
-              <div className="pointer-events-none absolute left-4 top-4 flex flex-wrap gap-2">
-                <Chip>{sizeLabel(config)}</Chip>
-                <Chip>{materialName(config.material)}</Chip>
+
+              {/* Top-left: outside / inside printing + spec chips */}
+              <div className="absolute left-3 top-3 flex flex-col items-start gap-2 sm:left-4 sm:top-4">
+                <div className="flex rounded-full border border-white/10 bg-black/60 p-1 text-xs font-semibold backdrop-blur">
+                  {(['outside', 'inside'] as const).map((side) => (
+                    <button
+                      key={side}
+                      onClick={() => switchSide(side)}
+                      className={`rounded-full px-3 py-1.5 uppercase tracking-wider transition ${
+                        printSide === side ? 'bg-amber-400 text-black' : 'text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      {side} printing
+                    </button>
+                  ))}
+                </div>
+                <div className="pointer-events-none hidden flex-wrap gap-2 sm:flex">
+                  <Chip>{sizeLabel(config, unit)}</Chip>
+                  <Chip>{materialName(config.material)}</Chip>
+                </div>
               </div>
-              <div className="pointer-events-none absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-xs text-white backdrop-blur">
-                <MousePointer2 className="h-3.5 w-3.5" /> Drag to rotate · Scroll to zoom
+
+              {/* Top-right: viewer tools */}
+              <div className="absolute right-3 top-3 flex flex-col gap-1.5 sm:right-4 sm:top-4">
+                <ToolButton label={autoRotate ? 'Stop rotating' : 'Auto-rotate'} active={autoRotate} onClick={() => setAutoRotate((r) => !r)}>
+                  <RotateCw className={`h-4 w-4 ${autoRotate ? 'animate-spin [animation-duration:3s]' : ''}`} />
+                </ToolButton>
+                <ToolButton label="Zoom in" onClick={() => send('zoom-in')}>
+                  <ZoomIn className="h-4 w-4" />
+                </ToolButton>
+                <ToolButton label="Zoom out" onClick={() => send('zoom-out')}>
+                  <ZoomOut className="h-4 w-4" />
+                </ToolButton>
+                <ToolButton label="Reset view" onClick={() => send('reset')}>
+                  <RotateCcw className="h-4 w-4" />
+                </ToolButton>
+                <ToolButton label={lidOpen ? 'Close box' : 'Open box'} active={lidOpen} onClick={() => setLidOpen((o) => !o)}>
+                  {lidOpen ? <PackageOpen className="h-4 w-4" /> : <Package className="h-4 w-4" />}
+                </ToolButton>
+              </div>
+
+              {/* Bottom: side tabs (jump the camera to a side) */}
+              <div className="absolute inset-x-3 bottom-3 flex justify-center sm:inset-x-4 sm:bottom-4">
+                <div className="flex max-w-full gap-1 overflow-x-auto rounded-full border border-white/10 bg-black/60 p-1 backdrop-blur [scrollbar-width:none]">
+                  {sideFaces.map((f) => (
+                    <button
+                      key={f.id}
+                      onClick={() => viewFace(f.id)}
+                      className="relative shrink-0 rounded-full px-3 py-1.5 text-xs font-medium text-neutral-300 transition hover:bg-white/10 hover:text-white"
+                    >
+                      {f.label}
+                      {usedFaces.has(f.id) && <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-amber-400" />}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
+
+            <p className="flex items-center justify-center gap-2 text-xs text-neutral-500">
+              <MousePointer2 className="h-3.5 w-3.5" /> Drag to rotate · Scroll to zoom · Click a side tab to jump to it
+            </p>
 
             <PricingCard config={config} price={price} onOrder={onOrder} />
           </div>
         </div>
       </div>
     </section>
+  );
+}
+
+function ToolButton({
+  label,
+  active,
+  onClick,
+  children,
+}: {
+  label: string;
+  active?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      aria-pressed={active}
+      className={`grid h-9 w-9 place-items-center rounded-full border backdrop-blur transition ${
+        active
+          ? 'border-amber-400/70 bg-amber-400 text-black'
+          : 'border-white/10 bg-black/60 text-neutral-300 hover:border-white/25 hover:text-white'
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -686,7 +1032,7 @@ function Panel({
 }: {
   icon: typeof Ruler;
   title: string;
-  hint?: string;
+  hint?: ReactNode;
   children: ReactNode;
 }) {
   return (
@@ -702,28 +1048,50 @@ function Panel({
   );
 }
 
+function UnitToggle({ unit, onChange }: { unit: Unit; onChange: (u: Unit) => void }) {
+  return (
+    <span className="flex rounded-full border border-white/10 p-0.5">
+      {(['in', 'cm', 'mm'] as const).map((u) => (
+        <button
+          key={u}
+          onClick={() => onChange(u)}
+          className={`rounded-full px-2 py-0.5 text-[11px] font-semibold transition ${
+            unit === u ? 'bg-amber-400 text-black' : 'text-neutral-400 hover:text-white'
+          }`}
+        >
+          {u}
+        </button>
+      ))}
+    </span>
+  );
+}
+
 function DimensionSlider({
   label,
+  unit,
   value,
   min,
   max,
   onChange,
 }: {
   label: string;
+  unit: Unit;
+  /** Inches */
   value: number;
   min: number;
   max: number;
-  onChange: (v: number) => void;
+  onChange: (inches: number) => void;
 }) {
   // Local draft lets users type "12" without being clamped mid-keystroke
-  const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
+  const shown = String(toUnit(value, unit));
+  const [draft, setDraft] = useState(shown);
+  useEffect(() => setDraft(shown), [shown]);
 
   const commit = () => {
     const n = parseFloat(draft);
-    const next = Number.isNaN(n) ? value : clamp(Math.round(n * 2) / 2, min, max);
+    const next = Number.isNaN(n) ? value : clamp(Math.round((n / UNIT_FACTOR[unit]) * 10) / 10, min, max);
     onChange(next);
-    setDraft(String(next));
+    setDraft(String(toUnit(next, unit)));
   };
 
   return (
@@ -734,16 +1102,13 @@ function DimensionSlider({
           <input
             type="number"
             inputMode="decimal"
-            min={min}
-            max={max}
-            step={0.5}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commit}
             onKeyDown={(e) => e.key === 'Enter' && commit()}
-            className="w-16 rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-right text-sm focus:border-amber-400 focus:outline-none focus:ring-1 focus:ring-amber-400"
+            className="w-20 rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-right text-sm focus:border-amber-400 focus:outline-none focus:ring-1 focus:ring-amber-400"
           />
-          <span className="text-xs text-neutral-500">in</span>
+          <span className="w-6 text-xs text-neutral-500">{unit}</span>
         </div>
       </div>
       <input
@@ -757,9 +1122,104 @@ function DimensionSlider({
         aria-label={`${label} in inches`}
       />
       <div className="flex justify-between text-[11px] text-neutral-500">
-        <span>{min}&quot;</span>
-        <span>{max}&quot;</span>
+        <span>
+          {toUnit(min, unit)} {unit}
+        </span>
+        <span>
+          {toUnit(max, unit)} {unit}
+        </span>
       </div>
+    </div>
+  );
+}
+
+function PrintMethodPicker({
+  config,
+  price,
+  onMethod,
+  onInk,
+}: {
+  config: BoxConfig;
+  price: PriceBreakdown;
+  onMethod: (m: PrintMethod) => void;
+  onInk: (id: InkId) => void;
+}) {
+  const method = PRINT_METHODS[config.printMethod];
+  const flexo = config.printMethod === 'flexo';
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-2">
+        {(Object.keys(PRINT_METHODS) as PrintMethod[]).map((id) => {
+          const m = PRINT_METHODS[id];
+          const active = config.printMethod === id;
+          return (
+            <button
+              key={id}
+              onClick={() => onMethod(id)}
+              className={`rounded-xl border p-3 text-left transition ${
+                active ? 'border-amber-400/70 bg-amber-400/10 ring-1 ring-amber-400/70' : 'border-white/10 hover:border-white/25'
+              }`}
+            >
+              <span className="flex items-center justify-between text-sm font-semibold">
+                {m.name.replace(' Printing', '')}
+                {active && <Check className="h-4 w-4 text-amber-400" />}
+              </span>
+              <span className="mt-0.5 block text-xs text-neutral-500">{m.tagline}</span>
+              {id === 'offset' && (
+                <span className="mt-2 flex gap-1">
+                  {['#22d3ee', '#e879f9', '#facc15', '#171717'].map((c) => (
+                    <span key={c} className="h-1 w-4 rounded-full" style={{ background: c }} />
+                  ))}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      <ul className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs text-neutral-400">
+        {method.perks.map((p) => (
+          <li key={p} className="flex items-center gap-1.5">
+            <Check className="h-3 w-3 shrink-0 text-amber-400" /> {p}
+          </li>
+        ))}
+      </ul>
+
+      {flexo && (
+        <div>
+          <p className="mb-2 text-xs text-neutral-400">
+            Ink colour: <span className="font-semibold text-white">{inkOf(config.ink).name}</span>
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {INKS.map((i) => (
+              <button
+                key={i.id}
+                onClick={() => onInk(i.id)}
+                aria-label={`${i.name} ink`}
+                title={i.name}
+                className={`h-8 w-8 rounded-lg border border-white/15 transition ${
+                  config.ink === i.id ? 'ring-2 ring-amber-400/70 ring-offset-2 ring-offset-neutral-950' : 'hover:scale-110'
+                }`}
+                style={{
+                  background: i.metallic ? `linear-gradient(135deg, ${i.hex}, #ffffff 45%, ${i.hex})` : i.hex,
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <p className="rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2 text-xs text-amber-200">
+        {flexo
+          ? `Printing charge: ${inr(FLEXO_CHARGE_PER_SIDE)} per printed side (any qty)`
+          : `Printing charge: ${inr(OFFSET_SETUP_CHARGE)} setup (any qty, all sides)`}
+        {price.printedSides > 0 && (
+          <span className="block text-amber-200/70">
+            {price.printedSides} side{price.printedSides > 1 ? 's' : ''} printed → {inr(price.printingCharge)}
+          </span>
+        )}
+      </p>
     </div>
   );
 }
@@ -769,19 +1229,34 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 interface ArtworkManagerProps {
   artworks: Artwork[];
+  selectedId: string | null;
+  printSide: PrintSide;
+  flexo: boolean;
+  inkName: string;
+  onSelect: (id: string | null) => void;
   onAdd: (files: File[]) => string[];
-  onUpdate: (id: string, patch: Partial<ArtworkPlacement>) => void;
+  onAddText: () => string;
+  onUpdate: (id: string, patch: ArtworkPatch) => void;
   onRemove: (art: Artwork) => void;
 }
 
-/** Upload several images, then place each one on any face with size / position / rotation controls. */
-function ArtworkManager({ artworks, onAdd, onUpdate, onRemove }: ArtworkManagerProps) {
+/** Upload images or add text, then place each on any side (outside or inside) with size / position / rotation. */
+function ArtworkManager({
+  artworks,
+  selectedId,
+  printSide,
+  flexo,
+  inkName,
+  onSelect,
+  onAdd,
+  onAddText,
+  onUpdate,
+  onRemove,
+}: ArtworkManagerProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const selected = artworks.find((a) => a.id === selectedId) ?? null;
   const remaining = MAX_ARTWORKS - artworks.length;
 
   const accept = (fileList: FileList | null | undefined) => {
@@ -794,12 +1269,12 @@ function ArtworkManager({ artworks, onAdd, onUpdate, onRemove }: ArtworkManagerP
 
     const problems: string[] = [];
     if (skipped) problems.push(`${skipped} file(s) skipped: use PNG, JPG or WebP under 5 MB.`);
-    if (valid.length > toAdd.length) problems.push(`You can add up to ${MAX_ARTWORKS} images.`);
+    if (valid.length > toAdd.length) problems.push(`You can add up to ${MAX_ARTWORKS} items.`);
     setError(problems.length ? problems.join(' ') : null);
 
     if (toAdd.length) {
       const ids = onAdd(toAdd);
-      setSelectedId(ids[ids.length - 1]);
+      onSelect(ids[ids.length - 1]);
     }
   };
 
@@ -812,40 +1287,52 @@ function ArtworkManager({ artworks, onAdd, onUpdate, onRemove }: ArtworkManagerP
   return (
     <div className="space-y-4">
       {remaining > 0 && (
-        <div
-          role="button"
-          tabIndex={0}
-          onClick={() => inputRef.current?.click()}
-          onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && inputRef.current?.click()}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={onDrop}
-          className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 text-center transition ${
-            artworks.length ? 'py-3' : 'py-6'
-          } ${dragging ? 'border-amber-400/70 bg-amber-400/10' : 'border-white/10 hover:border-white/25 hover:bg-white/5'}`}
-        >
-          <ImagePlus className="h-6 w-6 text-neutral-500" />
-          <p className="mt-2 text-sm font-medium">{artworks.length ? 'Add more images' : 'Drop your logo or artwork here'}</p>
-          <p className="text-xs text-neutral-500">Multiple files OK · PNG with transparency works best</p>
-          <input
-            ref={inputRef}
-            type="file"
-            multiple
-            accept={ACCEPTED_IMAGE_TYPES.join(',')}
-            className="hidden"
-            onChange={(e) => {
-              accept(e.target.files);
-              e.target.value = '';
+        <div className="grid grid-cols-[1fr_auto] gap-2">
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={() => inputRef.current?.click()}
+            onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && inputRef.current?.click()}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragging(true);
             }}
-          />
+            onDragLeave={() => setDragging(false)}
+            onDrop={onDrop}
+            className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-3 text-center transition ${
+              artworks.length ? 'py-3' : 'py-5'
+            } ${dragging ? 'border-amber-400/70 bg-amber-400/10' : 'border-white/10 hover:border-white/25 hover:bg-white/5'}`}
+          >
+            <ImagePlus className="h-5 w-5 text-neutral-500" />
+            <p className="mt-1.5 text-sm font-medium">{artworks.length ? 'Add images' : 'Drop logo / artwork'}</p>
+            <p className="text-[11px] text-neutral-500">PNG, JPG, WebP · multiple OK</p>
+            <input
+              ref={inputRef}
+              type="file"
+              multiple
+              accept={ACCEPTED_IMAGE_TYPES.join(',')}
+              className="hidden"
+              onChange={(e) => {
+                accept(e.target.files);
+                e.target.value = '';
+              }}
+            />
+          </div>
+          <button
+            onClick={() => onSelect(onAddText())}
+            className="flex w-24 flex-col items-center justify-center rounded-xl border-2 border-dashed border-white/10 px-2 text-center transition hover:border-white/25 hover:bg-white/5"
+          >
+            <Type className="h-5 w-5 text-neutral-500" />
+            <span className="mt-1.5 text-sm font-medium">Add text</span>
+          </button>
         </div>
       )}
+      <p className="text-[11px] text-neutral-500">
+        New items go on the {printSide === 'inside' ? 'inside' : 'outside'} of the box.
+        {flexo && ` Flexo prints everything in ${inkName.toLowerCase()} ink.`}
+      </p>
       {error && <p className="text-xs text-rose-400">{error}</p>}
 
-      {/* Uploaded artwork list */}
       {artworks.length > 0 && (
         <ul className="space-y-2">
           {artworks.map((art) => {
@@ -858,12 +1345,18 @@ function ArtworkManager({ artworks, onAdd, onUpdate, onRemove }: ArtworkManagerP
                   }`}
                 >
                   <button
-                    onClick={() => setSelectedId(active ? null : art.id)}
+                    onClick={() => onSelect(active ? null : art.id)}
                     className="flex min-w-0 flex-1 items-center gap-3 text-left"
                     aria-expanded={active}
                   >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={art.url} alt="" className="h-10 w-10 shrink-0 rounded-lg bg-white/5 object-contain p-1" />
+                    {art.kind === 'text' ? (
+                      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-white/5">
+                        <Type className="h-4 w-4 text-amber-400" />
+                      </span>
+                    ) : (
+                      /* eslint-disable-next-line @next/next/no-img-element */
+                      <img src={art.url} alt="" className="h-10 w-10 shrink-0 rounded-lg bg-white/5 object-contain p-1" />
+                    )}
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium">{art.name}</span>
                       <span className="block text-xs text-neutral-500">
@@ -872,21 +1365,15 @@ function ArtworkManager({ artworks, onAdd, onUpdate, onRemove }: ArtworkManagerP
                     </span>
                   </button>
                   <button
-                    onClick={() => {
-                      if (active) setSelectedId(null);
-                      onRemove(art);
-                    }}
-                    className="rounded-lg p-2 text-neutral-500 hover:bg-white/10 hover:text-rose-600"
+                    onClick={() => onRemove(art)}
+                    className="rounded-lg p-2 text-neutral-500 hover:bg-white/10 hover:text-rose-400"
                     aria-label={`Remove ${art.name}`}
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
                 </div>
 
-                {/* Placement editor for the selected artwork */}
-                {active && selected && (
-                  <ArtworkEditor art={selected} onChange={(patch) => onUpdate(selected.id, patch)} />
-                )}
+                {active && <ArtworkEditor art={art} flexo={flexo} onChange={(patch) => onUpdate(art.id, patch)} />}
               </li>
             );
           })}
@@ -896,60 +1383,89 @@ function ArtworkManager({ artworks, onAdd, onUpdate, onRemove }: ArtworkManagerP
   );
 }
 
-function ArtworkEditor({ art, onChange }: { art: Artwork; onChange: (patch: Partial<ArtworkPlacement>) => void }) {
+function FaceButtons({ faces, current, onPick }: { faces: { id: Face; label: string }[]; current: Face; onPick: (f: Face) => void }) {
+  return (
+    <div className="grid grid-cols-6 gap-1">
+      {faces.map((f) => (
+        <button
+          key={f.id}
+          onClick={() => onPick(f.id)}
+          className={`rounded-lg px-1 py-1.5 text-[11px] font-medium transition ${
+            current === f.id ? 'bg-amber-400 text-black' : 'bg-white/[0.04] text-neutral-400 hover:bg-white/10'
+          }`}
+        >
+          {f.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ArtworkEditor({ art, flexo, onChange }: { art: Artwork; flexo: boolean; onChange: (patch: ArtworkPatch) => void }) {
+  const text = art.text;
+
   return (
     <div className="mt-2 space-y-4 rounded-xl border border-white/10 bg-white/[0.03] p-3">
-      <div>
-        <p className="mb-2 text-xs font-medium text-neutral-400">Box side</p>
-        <div className="grid grid-cols-5 gap-1">
-          {FACES.map((f) => (
+      {text && (
+        <div className="space-y-3">
+          <textarea
+            value={text.content}
+            rows={2}
+            maxLength={80}
+            onChange={(e) => onChange({ text: { ...text, content: e.target.value } })}
+            placeholder="Type your text"
+            className="w-full resize-none rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-neutral-100 focus:border-amber-400 focus:outline-none focus:ring-1 focus:ring-amber-400"
+          />
+          <div className="flex flex-wrap items-center gap-1">
+            {FONTS.map((f) => (
+              <button
+                key={f.id}
+                onClick={() => onChange({ text: { ...text, font: f.id } })}
+                className={`rounded-lg px-2.5 py-1.5 text-xs transition ${
+                  text.font === f.id ? 'bg-amber-400 text-black' : 'bg-white/[0.04] text-neutral-400 hover:bg-white/10'
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
             <button
-              key={f.id}
-              onClick={() => onChange({ face: f.id })}
-              className={`rounded-lg px-1 py-1.5 text-xs font-medium transition ${
-                art.face === f.id ? 'bg-amber-400 text-black' : 'bg-white/[0.04] text-neutral-400 hover:bg-white/10'
+              onClick={() => onChange({ text: { ...text, bold: !text.bold } })}
+              aria-pressed={text.bold}
+              className={`ml-auto rounded-lg px-2.5 py-1.5 text-xs font-bold transition ${
+                text.bold ? 'bg-amber-400 text-black' : 'bg-white/[0.04] text-neutral-400 hover:bg-white/10'
               }`}
             >
-              {f.label}
+              B
             </button>
-          ))}
+            {!flexo && (
+              <label className="relative grid h-7 w-7 cursor-pointer place-items-center rounded-lg border border-white/15" title="Text colour">
+                <span className="h-4 w-4 rounded" style={{ background: text.color }} />
+                <input
+                  type="color"
+                  value={text.color}
+                  onChange={(e) => onChange({ text: { ...text, color: e.target.value } })}
+                  className="absolute inset-0 cursor-pointer opacity-0"
+                />
+              </label>
+            )}
+          </div>
         </div>
+      )}
+
+      <div className="space-y-2">
+        <p className="text-xs font-medium text-neutral-400">Outside</p>
+        <FaceButtons faces={OUTSIDE_FACES} current={art.face} onPick={(face) => onChange({ face })} />
+        <p className="pt-1 text-xs font-medium text-neutral-400">Inside</p>
+        <FaceButtons faces={INSIDE_FACES} current={art.face} onPick={(face) => onChange({ face })} />
       </div>
 
-      <RangeControl
-        label="Size"
-        value={Math.round(art.size * 100)}
-        min={10}
-        max={100}
-        unit="%"
-        onChange={(v) => onChange({ size: v / 100 })}
-      />
-      <RangeControl
-        label="Left / right"
-        value={Math.round(art.offsetX * 100)}
-        min={-50}
-        max={50}
-        onChange={(v) => onChange({ offsetX: v / 100 })}
-      />
-      <RangeControl
-        label="Down / up"
-        value={Math.round(art.offsetY * 100)}
-        min={-50}
-        max={50}
-        onChange={(v) => onChange({ offsetY: v / 100 })}
-      />
-      <RangeControl
-        label="Rotation"
-        value={art.rotation}
-        min={-180}
-        max={180}
-        step={5}
-        unit="°"
-        onChange={(v) => onChange({ rotation: v })}
-      />
+      <RangeControl label="Size" value={Math.round(art.size * 100)} min={10} max={100} unit="%" onChange={(v) => onChange({ size: v / 100 })} />
+      <RangeControl label="Left / right" value={Math.round(art.offsetX * 100)} min={-50} max={50} onChange={(v) => onChange({ offsetX: v / 100 })} />
+      <RangeControl label="Down / up" value={Math.round(art.offsetY * 100)} min={-50} max={50} onChange={(v) => onChange({ offsetY: v / 100 })} />
+      <RangeControl label="Rotation" value={art.rotation} min={-180} max={180} step={5} unit="°" onChange={(v) => onChange({ rotation: v })} />
 
       <button
-        onClick={() => onChange({ size: 0.5, offsetX: 0, offsetY: 0, rotation: 0 })}
+        onClick={() => onChange({ size: art.kind === 'text' ? 0.6 : 0.5, offsetX: 0, offsetY: 0, rotation: 0 })}
         className="text-xs font-medium text-amber-400 hover:underline"
       >
         Reset placement
@@ -997,46 +1513,86 @@ function RangeControl({
   );
 }
 
-function QuantitySelector({ config, onChange }: { config: BoxConfig; onChange: (q: Quantity) => void }) {
-  const unitAt = (q: Quantity) => calculatePrice({ ...config, quantity: q }).unitCost;
-  const baseUnit = unitAt(100);
+function QuantitySelector({ config, onChange }: { config: BoxConfig; onChange: (q: number) => void }) {
+  const { presets, minQty } = PRINT_METHODS[config.printMethod];
+  const unitAt = (q: number) => calculatePrice({ ...priceInputOf(config), quantity: q }).unitCost;
+  const baseUnit = unitAt(presets[0]);
+  const custom = !presets.includes(config.quantity);
+
+  const [draft, setDraft] = useState(custom ? String(config.quantity) : '');
+  useEffect(() => {
+    if (!presets.includes(config.quantity)) setDraft(String(config.quantity));
+  }, [config.quantity, presets]);
+
+  const commit = () => {
+    const n = Math.round(Number(draft));
+    if (!draft.trim() || Number.isNaN(n)) return;
+    const q = clamp(n, minQty, MAX_QTY);
+    onChange(q);
+    setDraft(String(q));
+  };
 
   return (
-    <div className="grid grid-cols-2 gap-2">
-      {QUANTITIES.map((q) => {
-        const unit = unitAt(q);
-        const savings = Math.round((1 - unit / baseUnit) * 100);
-        const badge = q === 1000 ? 'Best Value' : q === 200 ? 'Popular' : savings > 0 ? `Save ${savings}%` : null;
-        const active = config.quantity === q;
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-2">
+        {presets.map((q, i) => {
+          const unit = unitAt(q);
+          const savings = Math.round((1 - unit / baseUnit) * 100);
+          const last = i === presets.length - 1;
+          const badge = last ? 'Best Value' : i === 1 ? 'Popular' : savings > 0 ? `Save ${savings}%` : null;
+          const active = config.quantity === q;
 
-        return (
-          <button
-            key={q}
-            onClick={() => onChange(q)}
-            className={`relative rounded-xl border p-3 pt-4 text-left transition ${
-              active ? 'border-amber-400/70 bg-amber-400/10 ring-1 ring-amber-400/70' : 'border-white/10 hover:border-white/25'
-            }`}
-          >
-            {badge && (
-              <span
-                className={`absolute -top-2 right-2 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                  q === 1000 ? 'bg-amber-400 text-black' : 'bg-neutral-800 text-neutral-200'
-                }`}
-              >
-                {badge}
-              </span>
-            )}
-            <span className="block text-base font-semibold">{q.toLocaleString('en-IN')} units</span>
-            <span className="block text-xs text-neutral-500">{inr(unit, 2)} / box</span>
-          </button>
-        );
-      })}
+          return (
+            <button
+              key={q}
+              onClick={() => onChange(q)}
+              className={`relative rounded-xl border p-3 pt-4 text-left transition ${
+                active ? 'border-amber-400/70 bg-amber-400/10 ring-1 ring-amber-400/70' : 'border-white/10 hover:border-white/25'
+              }`}
+            >
+              {badge && (
+                <span
+                  className={`absolute -top-2 right-2 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                    last ? 'bg-amber-400 text-black' : 'bg-neutral-800 text-neutral-200'
+                  }`}
+                >
+                  {badge}
+                </span>
+              )}
+              <span className="block text-base font-semibold">{q.toLocaleString('en-IN')} units</span>
+              <span className="block text-xs text-neutral-500">{inr(unit, 2)} / box</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <label
+        className={`flex items-center gap-2 rounded-xl border px-3 py-2 transition ${
+          custom ? 'border-amber-400/70 bg-amber-400/10' : 'border-white/10'
+        }`}
+      >
+        <span className="text-xs font-medium text-neutral-400">Custom quantity</span>
+        <input
+          type="number"
+          inputMode="numeric"
+          min={minQty}
+          max={MAX_QTY}
+          placeholder={`${minQty}+`}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => e.key === 'Enter' && commit()}
+          className="ml-auto w-24 rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-right text-sm focus:border-amber-400 focus:outline-none focus:ring-1 focus:ring-amber-400"
+        />
+        <span className="text-xs text-neutral-500">boxes</span>
+      </label>
     </div>
   );
 }
 
 function PricingCard({ config, price, onOrder }: { config: BoxConfig; price: PriceBreakdown; onOrder: () => void }) {
   const [showBreakdown, setShowBreakdown] = useState(false);
+  const flexo = config.printMethod === 'flexo';
 
   return (
     <div
@@ -1057,7 +1613,9 @@ function PricingCard({ config, price, onOrder }: { config: BoxConfig; price: Pri
             </motion.p>
           </div>
           <div>
-            <p className="text-xs uppercase tracking-wider text-neutral-500">Total · {config.quantity} units</p>
+            <p className="text-xs uppercase tracking-wider text-neutral-500">
+              Total · {config.quantity.toLocaleString('en-IN')} units
+            </p>
             <motion.p
               key={price.total}
               initial={{ opacity: 0.4, y: 4 }}
@@ -1077,12 +1635,17 @@ function PricingCard({ config, price, onOrder }: { config: BoxConfig; price: Pri
         </button>
       </div>
 
-      <button
-        onClick={() => setShowBreakdown((s) => !s)}
-        className="mt-5 text-xs font-medium text-neutral-500 underline-offset-4 hover:text-white hover:underline"
-      >
-        {showBreakdown ? 'Hide' : 'Show'} price breakdown
-      </button>
+      <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+        <button
+          onClick={() => setShowBreakdown((s) => !s)}
+          className="text-xs font-medium text-neutral-500 underline-offset-4 hover:text-white hover:underline"
+        >
+          {showBreakdown ? 'Hide' : 'Show'} price breakdown
+        </button>
+        <span className="flex items-center gap-1.5 text-xs text-emerald-300">
+          <BadgeCheck className="h-3.5 w-3.5" /> Free design review before production
+        </span>
+      </div>
 
       <AnimatePresence initial={false}>
         {showBreakdown && (
@@ -1095,8 +1658,20 @@ function PricingCard({ config, price, onOrder }: { config: BoxConfig; price: Pri
             <div className="mt-4 grid gap-2 border-t border-white/10 pt-4 text-sm sm:grid-cols-2 sm:gap-x-8">
               <Row label="Surface area" value={`${price.surfaceArea.toFixed(1)} sq in`} />
               <Row label="Material cost / box" value={inr(price.baseMaterialCost, 2)} />
-              <Row label="Print cost / box" value={inr(price.printCostPerUnit, 2)} />
-              <Row label="Print setup (one-time)" value={inr(price.setupFee)} />
+              <Row
+                label={`Print cost / box${flexo && price.printedSides > 1 ? ` (${price.printedSides} sides)` : ''}`}
+                value={inr(price.printCostPerUnit, 2)}
+              />
+              <Row
+                label={
+                  price.printedSides === 0
+                    ? 'Printing charge'
+                    : flexo
+                      ? `Printing charge (${price.printedSides} × ${inr(FLEXO_CHARGE_PER_SIDE)})`
+                      : 'Offset setup (one-time)'
+                }
+                value={price.printedSides === 0 ? 'No print' : inr(price.printingCharge)}
+              />
             </div>
             <p className="mt-3 text-xs text-neutral-500">Prices exclude GST and shipping.</p>
           </motion.dl>
@@ -1287,8 +1862,23 @@ function validate(f: LeadForm): FormErrors {
 
 const WHATSAPP_NUMBER = process.env.NEXT_PUBLIC_WHATSAPP_NUMBER ?? '919999999999';
 
+type ProofOption = 'review' | 'as-is';
+
+const PROOF_OPTIONS: { id: ProofOption; title: string; body: string }[] = [
+  { id: 'review', title: 'Send me a proof to approve', body: 'Our designer checks your artwork and sends a proof before printing.' },
+  { id: 'as-is', title: 'Print as designed', body: 'Skip the proof and go straight to production.' },
+];
+
+/** One-line print summary, e.g. "Flexo, black ink · 2 sides". */
+const printSummary = (config: BoxConfig, price: PriceBreakdown) =>
+  price.printedSides === 0
+    ? 'No printing (plain box)'
+    : `${config.printMethod === 'flexo' ? `Flexo, ${inkOf(config.ink).name.toLowerCase()} ink` : 'Offset, full colour'} · ${
+        price.printedSides
+      } side${price.printedSides > 1 ? 's' : ''}`;
+
 /** Builds a wa.me deep link with the full order spec URL-encoded. */
-function buildWhatsAppUrl(mode: CheckoutMode, form: LeadForm, config: BoxConfig, price: PriceBreakdown) {
+function buildWhatsAppUrl(mode: CheckoutMode, form: LeadForm, config: BoxConfig, price: PriceBreakdown, proof: ProofOption) {
   const lines =
     mode === 'sample'
       ? [
@@ -1314,22 +1904,24 @@ function buildWhatsAppUrl(mode: CheckoutMode, form: LeadForm, config: BoxConfig,
           `Size (L × W × H): ${sizeLabel(config)}`,
           `Material: ${materialName(config.material)}`,
           `Base colour: ${config.color.toUpperCase()}`,
+          `Printing: ${printSummary(config, price)}`,
           ...(config.artworks.length
             ? [
-                `Artwork (${config.artworks.length}, will share files in this chat):`,
+                `Artwork (${config.artworks.length}, will share image files in this chat):`,
                 ...config.artworks.map(
                   (a, i) =>
-                    `  ${i + 1}. ${a.name}: ${faceLabel(a.face)}, ${Math.round(a.size * 100)}% wide${
-                      a.rotation ? `, rotated ${a.rotation}°` : ''
-                    }`,
+                    `  ${i + 1}. ${a.kind === 'text' ? `Text "${a.text?.content.replace(/\n/g, ' ')}"` : a.name}: ${faceLabel(
+                      a.face,
+                    )}, ${Math.round(a.size * 100)}% wide${a.rotation ? `, rotated ${a.rotation}°` : ''}`,
                 ),
               ]
             : ['Artwork: None']),
-          `Quantity: ${config.quantity} units`,
+          `Quantity: ${config.quantity.toLocaleString('en-IN')} units`,
+          `Proof: ${PROOF_OPTIONS.find((p) => p.id === proof)!.title}`,
           '',
           '*Pricing*',
           `Per box: ${inr(price.unitCost, 2)}`,
-          `Print setup: ${inr(price.setupFee)}`,
+          `Printing charge: ${inr(price.printingCharge)}`,
           `Total: ${inr(price.total)} (excl. GST & shipping)`,
         ];
 
@@ -1379,6 +1971,7 @@ function CheckoutDrawer({ mode, onClose, config, price }: CheckoutDrawerProps) {
   const [errors, setErrors] = useState<FormErrors>({});
   const [status, setStatus] = useState<'idle' | 'paying' | 'paid' | 'error'>('idle');
   const [message, setMessage] = useState<string | null>(null);
+  const [proof, setProof] = useState<ProofOption>('review');
   const open = mode !== null;
 
   // Reset transient state each time the drawer opens
@@ -1416,7 +2009,7 @@ function CheckoutDrawer({ mode, onClose, config, price }: CheckoutDrawerProps) {
 
   const handleWhatsApp = () => {
     if (!mode || !checkValid()) return;
-    window.open(buildWhatsAppUrl(mode, form, config, price), '_blank', 'noopener,noreferrer');
+    window.open(buildWhatsAppUrl(mode, form, config, price, proof), '_blank', 'noopener,noreferrer');
   };
 
   const handlePay = async () => {
@@ -1454,7 +2047,9 @@ function CheckoutDrawer({ mode, onClose, config, price }: CheckoutDrawerProps) {
         size: sizeLabel(config),
         material: materialName(config.material),
         color: config.color,
+        printing: printSummary(config, price),
         quantity: String(config.quantity),
+        proof,
       },
       theme: { color: '#f5a524' },
       handler: (res: { razorpay_payment_id: string }) => {
@@ -1535,21 +2130,50 @@ function CheckoutDrawer({ mode, onClose, config, price }: CheckoutDrawerProps) {
                             </span>
                           }
                         />
+                        <Row label="Printing" value={printSummary(config, price)} />
                         <Row
                           label="Artwork"
                           value={
                             config.artworks.length
-                              ? `${config.artworks.length} image(s) · ${[...new Set(config.artworks.map((a) => faceLabel(a.face)))].join(', ')}`
+                              ? `${config.artworks.length} item(s) · ${[...new Set(config.artworks.map((a) => faceLabel(a.face)))].join(', ')}`
                               : 'None'
                           }
                         />
-                        <Row label="Quantity" value={`${config.quantity} units`} />
+                        <Row label="Quantity" value={`${config.quantity.toLocaleString('en-IN')} units`} />
                       </dl>
                       <div className="mt-3 flex items-end justify-between border-t border-white/10 pt-3">
                         <span className="text-sm text-neutral-500">{inr(price.unitCost, 2)} / box</span>
                         <span className="font-display text-2xl font-bold">{inr(price.total)}</span>
                       </div>
                     </div>
+                  )}
+
+                  {/* Proof approval */}
+                  {!isSample && price.printedSides > 0 && (
+                    <fieldset className="space-y-2">
+                      <legend className="mb-2 text-sm font-medium text-neutral-300">Before we print</legend>
+                      {PROOF_OPTIONS.map((p) => (
+                        <label
+                          key={p.id}
+                          className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
+                            proof === p.id ? 'border-amber-400/70 bg-amber-400/10' : 'border-white/10 hover:border-white/25'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="proof"
+                            value={p.id}
+                            checked={proof === p.id}
+                            onChange={() => setProof(p.id)}
+                            className="mt-0.5 accent-amber-400"
+                          />
+                          <span>
+                            <span className="block text-sm font-medium">{p.title}</span>
+                            <span className="block text-xs text-neutral-500">{p.body}</span>
+                          </span>
+                        </label>
+                      ))}
+                    </fieldset>
                   )}
 
                   {/* Lead form */}
